@@ -1,10 +1,8 @@
 # Copyright 2025 Xiaomi Corporation.
 import math
 
-import numpy as np
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_varlen_func
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
@@ -218,11 +216,7 @@ class RotaryEmbedding(nn.Module):
         inv_freq_expanded = self.inv_freq[:, None].float().expand(-1, 1).to(x.device)
         position_ids_expanded = position_ids[None, :].float()
 
-        device_type = (
-            x.device.type
-            if isinstance(x.device.type, str) and x.device.type != "mps"
-            else "cpu"
-        )
+        device_type = x.device.type
         with torch.autocast(device_type=device_type, enabled=False):  # Force float32
             freqs = (
                 inv_freq_expanded.float() @ position_ids_expanded.float()
@@ -253,7 +247,6 @@ class RMSNorm(nn.Module):
 
 
 LAYER_NORM = {"LayerNorm": nn.LayerNorm, "RMSNorm": RMSNorm}
-
 
 class Attention(nn.Module):
     def __init__(self, embed_dim, num_heads, window_size=(-1, -1), causal=False):
@@ -295,17 +288,70 @@ class Attention(nn.Module):
             torch.int32
         )
         max_seqlen = torch.max(seq_len).to(torch.int32).detach()
-        attn_output = flash_attn_varlen_func(
-            query_states,
-            key_states,
-            value_states,
-            cu_len,
-            cu_len,
-            max_seqlen,
-            max_seqlen,
-            causal=self.causal,
-            window_size=self.window_size,
+
+        # 1. Determine batch dimensions and lengths
+        batch_size = cu_len.shape[0] - 1
+        sequence_lengths = cu_len[1:] - cu_len[:-1]
+        num_heads = query_states.shape[1]
+        head_dimension = query_states.shape[2]
+
+        # 2. Create a boolean validity mask for efficient padding/unpadding
+        token_indices = torch.arange(max_seqlen, device=query_states.device).unsqueeze(0).expand(batch_size, -1)
+        valid_padding_mask = token_indices < sequence_lengths.unsqueeze(1)
+
+        # 3. Allocate padded tensors and scatter the variable-length flat sequences into them
+        query_states_padded = torch.zeros(batch_size, max_seqlen, num_heads, head_dimension, dtype=query_states.dtype,
+                                          device=query_states.device)
+        query_states_padded[valid_padding_mask] = query_states
+
+        key_states_padded = torch.zeros(batch_size, max_seqlen, num_heads, head_dimension, dtype=key_states.dtype,
+                                        device=key_states.device)
+        key_states_padded[valid_padding_mask] = key_states
+
+        value_states_padded = torch.zeros(batch_size, max_seqlen, num_heads, head_dimension, dtype=value_states.dtype,
+                                          device=value_states.device)
+        value_states_padded[valid_padding_mask] = value_states
+
+        # 4. Construct the comprehensive attention mask
+        # Base mask: true only where both the query token and key token are valid (not padding)
+        valid_attention_mask = valid_padding_mask.unsqueeze(2) & valid_padding_mask.unsqueeze(1)
+        valid_attention_mask = valid_attention_mask.unsqueeze(1)  # Shape: (batch_size, 1, max_seqlen, max_seqlen)
+
+        # Apply causal masking if requested
+        if self.causal:
+            causal_mask = torch.tril(torch.ones(max_seqlen, max_seqlen, dtype=torch.bool, device=query_states.device))
+            valid_attention_mask = valid_attention_mask & causal_mask
+
+        # Apply sliding window masking if constraints are provided (where >= 0 implies an active constraint)
+        window_left, window_right = self.window_size
+        if window_left is not None or window_right is not None:
+            position_indices = torch.arange(max_seqlen, device=query_states.device)
+            distance_matrix = position_indices.unsqueeze(1) - position_indices.unsqueeze(0)
+
+            if window_left is not None and window_left >= 0:
+                valid_attention_mask = valid_attention_mask & (distance_matrix <= window_left)
+            if window_right is not None and window_right >= 0:
+                valid_attention_mask = valid_attention_mask & (-distance_matrix <= window_right)
+
+        # 5. Transpose padded tensors for SDPA expected shape: (batch_size, num_heads, sequence_length, head_dimension)
+        query_states_padded = query_states_padded.transpose(1, 2)
+        key_states_padded = key_states_padded.transpose(1, 2)
+        value_states_padded = value_states_padded.transpose(1, 2)
+
+        # 6. Execute standard PyTorch Scaled Dot-Product Attention
+        attention_output_padded = F.scaled_dot_product_attention(
+            query_states_padded,
+            key_states_padded,
+            value_states_padded,
+            attn_mask=valid_attention_mask,
+            dropout_p=0.0,
+            is_causal=False  # Causal logic is already embedded directly in the custom valid_attention_mask
         )
+
+        # 7. Transpose back and extract the valid tokens to match the original flat variable-length format
+        attention_output_padded = attention_output_padded.transpose(1, 2)
+        attn_output = attention_output_padded[valid_padding_mask]
+
         attn_output = attn_output.reshape(bsz, self.embed_dim)
         attn_output = self.out_proj(attn_output)
         return attn_output
@@ -376,7 +422,7 @@ class TransformerVocos(nn.Module):
         )
         self.embeddings = nn.Linear(config.n_mels, config.vocoder_dim, bias=False)
 
-        self.poisition_embedding = RotaryEmbedding(
+        self.position_embedding = RotaryEmbedding(
             config.rope_theta,
             config.vocoder_dim // config.vocoder_attention_heads,
             self.max_source_positions,
@@ -415,7 +461,7 @@ class TransformerVocos(nn.Module):
         )
         x = self.embeddings(x)
         position_ids = torch.arange(0, x.size(0), device=x.device, dtype=torch.long)
-        rope_position_embeddings = self.poisition_embedding(x, position_ids)
+        rope_position_embeddings = self.position_embedding(x, position_ids)
         for idx, layer in enumerate(self.layers):
             x = layer(
                 x, input_length, rope_position_embeddings=rope_position_embeddings

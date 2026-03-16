@@ -8,3 +8,6 @@ checkpoints/
 *.pyd
 *.pyw
 *.pyz
+
+.idea
+models/

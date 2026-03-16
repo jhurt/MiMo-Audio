@@ -84,7 +84,7 @@ class MultiModalSpeechInterface:
     def initialize_model(self, model_path=None, tokenizer_path=None):
 
         try:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
             
             if model_path is None:
                 model_path = "./models/MiMo-Audio-7B-Instruct"
@@ -333,7 +333,7 @@ class MultiModalSpeechInterface:
                             gr.Markdown("### 💻 System information")
                             device_info = gr.Textbox(
                                 label="Device information",
-                                value=f"GPU available: {'Yes' if torch.cuda.is_available() else 'No'}",
+                                value=f"GPU available: {'Yes' if torch.backends.mps.is_available() else 'No'}",
                                 interactive=False
                             )
                 
